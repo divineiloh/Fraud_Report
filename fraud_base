@@ -1,0 +1,523 @@
+create or replace table `sample_table` as (
+with 
+status as (
+select DRVR_USER_ID, MARKET_NM, LAST_DEACTVD_DT, DRVR_STATUS, ONBDG_DT
+from (
+        select DRVR_USER_ID, date(DRVR_ONBDG_TS) as ONBDG_DT, MARKET_NM, date(LAST_DEATVD_TS) as LAST_DEACTVD_DT,
+        case when DRVR_ACTV_IND = 0 then 'deactivated'
+                else 'active' end as DRVR_STATUS,
+        row_number() over(partition by DRVR_USER_ID order by UPD_TS desc) as rn
+        from Driver_table)
+where rn = 1
+),
+
+spark_now as (
+select DRVR_USER_ID,  date(min(ACTV_START_TS)) first_spark_now_ability_dt, date(min(if(ACTV_NM = 'ONLINE', ACTV_START_TS, null))) as first_spark_now_dt
+from  `activity_table` 
+where RSN_DESC = 'NONE'
+group by 1
+),
+
+paused_drivers as (
+select DRVR_USER_ID,
+        date(max(ACTV_START_TS)) latest_paused_dt, 
+from  `activity_table` 
+where RSN_DESC <> 'NONE'
+group by 1
+),
+
+
+fin as (
+select dat.email as DRVR_USER_ID, status.DRVR_STATUS, LAST_DEACTVD_DT, ONBDG_DT,
+        latest_idv_fail as latest_idv_fail_dt, 
+        latest_ocr_fail as latest_ocr_fail_dt, 
+        latest_mvr_denied as latest_mvr_denied_dt,
+        latest_cbc_denied as latest_cbc_denied_dt,
+        latest_invalid_insurance, 
+        fst.most_recent_dt as fraud_star_latest_flag_dt, 
+        acc.DEACTD_DT as acct_sharing_flag_dt, 
+        rt.last_flagged_date as radar_latest_flag_dt, 
+        ink.LATEST_FLAG_DT as inkiru_latest_flag_dt,
+        per.date_flagged as persona_latest_flag_dt, 
+        graph.FLAG_DT as graph_latest_flag_dt, 
+        fraud_ops.most_recent_flag_dt as fraud_ops_latest_flag_dt,
+        shield.Last_Flagged_date as shield_latest_flag_dt,
+        sn.first_spark_now_ability_dt, sn.first_spark_now_dt,
+        pd.latest_paused_dt, latest_withdrawn as CMS_Withdrawn_DT, all_cms_withdrawn,
+
+
+
+        case when latest_idv_fail is null then null else 'idv_fail' end as latest_idv_fail_ind,
+         case when latest_ocr_fail is null then null else 'ocr_fail' end as latest_ocr_fail_ind,
+         case when latest_mvr_denied is null then null else 'mvr_denied' end as latest_mvr_denied_ind,
+         case when latest_cbc_denied is null then null else 'cbc_denied' end as latest_cbc_denied_ind,
+         case when latest_invalid_insurance is null then null else 'invalid_insurance' end as latest_invalid_insurance_ind,
+
+         case when fst.most_recent_dt is null then null else 'fraud_star_flag' end as fraud_star_flag_ind,
+         case when acc.DEACTD_DT is null then null else 'acct_sharing_flag' end as acct_sharing_flag_ind,
+         case when rt.last_flagged_date is null then null else 'radar_flag' end as radar_flag_ind,
+         case when ink.LATEST_FLAG_DT is null then null else 'inkiru_flag' end as inkiru_flag_ind,
+         case when per.date_flagged is null then null else 'persona_flag' end as persona_flag_ind,
+
+         case when graph.FLAG_DT is null then null else 'graph_flag' end as graph_flag_ind,
+         case when fraud_ops.most_recent_flag_dt is null then null else 'fraud_ops_flag' end as fraud_ops_flag_ind,
+         case when shield.Last_Flagged_date is null then null else 'shield_flag' end as shield_flag_ind,
+         case when sn.first_spark_now_ability_dt is null then 0 else 1 end as first_spark_now_ability_ind,
+         case when sn.first_spark_now_dt is null then 0 else 1 end as first_spark_now_ind
+
+
+
+from dat
+left join status
+on dat.email = status.drvr_user_id
+left join fst
+on dat.email = fst.DRVR_USER_ID
+left join acc
+on dat.email = acc.DRVR_USER_ID
+left join rt 
+on dat.email = rt.email
+left join ink 
+on dat.email = ink.DRVR_USER_ID
+left join per
+on dat.email = per.DRVR_USER_ID
+left join graph 
+on dat.email = graph.DRVR_USER_ID
+left join spark_now sn 
+on dat.email = sn.drvr_user_id
+left join paused_drivers pd 
+on dat.email = pd.drvr_user_id
+left join (
+        select distinct DRVR_USER_ID, MOST_RECENT_FLAG_DT
+        from invest_table
+        where covered_in_fraud_star = false
+        ) fraud_ops
+on dat.email = fraud_ops.DRVR_USER_ID
+left join shield 
+on dat.email = shield.DRVR_USER_ID
+),
+
+ds_delivered as (
+select distinct DRVR_USER_ID, count(distinct TRIP_ID) as Delivered_Trips
+from delivery_table
+where (CARRIER_DLVR_TS_TZ is not null or RETURNED_TS_TZ is not null)
+group by 1
+),
+
+ds_accepted as (
+select distinct DRVR_USER_ID, count(distinct TRIP_ID) as Accepted_Trips
+from delivery_table
+group by 1
+)
+
+select fin.* except(DRVR_STATUS), 
+        ifnull(dsd.Delivered_Trips, 0) as Delivered_Trips, 
+        ifnull(dsa.Accepted_Trips, 0) as Accepted_Trips,
+        case when Delivered_Trips is not null then 'Yes'
+                else 'No' end as Trip_Completed_Ind,
+        case when DRVR_STATUS is not null then DRVR_STATUS
+              when CMS_Withdrawn_DT is not null then 'CMS_withdrawn'
+              else 'applicant' end as DRVR_STATUS
+from fin
+left join ds_delivered dsd 
+on fin.DRVR_USER_ID = dsd.drvr_user_id
+left join ds_accepted dsa 
+on fin.DRVR_USER_ID = dsa.drvr_user_id
+);
+
+#######################################################################
+#### APPEALS 
+#######################################################################
+
+create or replace table sample_appeals as (
+with appeals_raw as (
+  -- pull data from driver_appeals table
+  select 
+    email as drvr_user_id,
+    user_id as drvr_uuid,
+    status as appeal_status,
+    reason_code as appeal_reason_code,
+    sub_reason_code as appeal_sub_reason_code,
+    outcome as appeal_outcome,
+    reason_for_overturn as overturn_reason,
+
+    date_created as appeal_creation_ts,
+    reported_on as appeal_report_ts,
+    marked_complete_ts as appeal_complete_ts
+
+  from `appeals_table`
+)
+
+, joined as (
+  -- for each driver with a last deactvd date in our data, find if they had an appeal afterward. In the case of multiple appeals, prioritize completed appeals for pulling data. If any were marked as Overturned, mark them as overturned for now.
+
+  select a.*, 
+    max(case when b.appeal_status is not null then 1 else 0 end) as appealed,
+    max(case when b.appeal_status = 'Complete' then 1 when b.appeal_status is not null then 0 else null end) as completed_appeal,
+    max_by(appeal_reason_code, case when b.appeal_status = 'Complete' then 1 when b.appeal_status is not null then 0 else null end) as appeal_reason_code,
+    max_by(appeal_sub_reason_code, case when b.appeal_status = 'Complete' then 1 when b.appeal_status is not null then 0 else null end) as appeal_sub_reason_code,
+    max(case when appeal_outcome = 'Overturned' then 1 when b.appeal_status = 'Complete' then 0 else null end) as overturned,
+    date(max_by(appeal_report_ts, case when b.appeal_status = 'Complete' then 1 when b.appeal_status is not null then 0 else null end)) as latest_appeal_report_date,
+    date(max_by(appeal_complete_ts, case when b.appeal_status = 'Complete' then 1 when b.appeal_status is not null then 0 else null end)) as latest_appeal_complete_date,
+
+  from (
+    select drvr_user_id, last_deactvd_dt, drvr_status
+    from sample_table 
+    where last_deactvd_dt is not null
+  ) a
+  left join appeals_raw b
+  on a.drvr_user_id = b.drvr_user_id 
+  and date(b.appeal_report_ts) >= a.last_deactvd_dt
+  group by a.drvr_user_id, a.last_deactvd_dt, drvr_status
+
+)
+
+-- for incorrectly marked overturns, change it to not overturned
+select 
+  * except(overturned),
+  if (
+    overturned is null,
+    null,
+    case 
+      when drvr_status = 'deactivated' and overturned = 1
+      then 0
+
+      else overturned
+      end
+  ) as overturned
+from joined 
+);
+
+#######################################################################
+#### FINAL TABLE 
+#######################################################################
+
+create or replace table `final_table` as (
+select efr.*,
+        case when efa.appealed is not null then efa.appealed
+                else 0 end as appealed,
+        case when efa.completed_appeal is not null then efa.completed_appeal
+                else 0 end as completed_appeal,
+        case when efa.overturned is not null then efa.overturned
+                else 0 end as overturned,
+
+        appeal_reason_code, appeal_sub_reason_code, latest_appeal_report_date, 
+        latest_appeal_complete_date, 
+
+
+
+  ## KPI 1 - PREVENTION: DRIVERS/APPLICANTS BLOCKED BEFORE SPARK NOW DIVIDED BY TOTAL NEW DRIVERS
+  -- date of drivers blocked before spark now
+  (SELECT MAX(d)
+  FROM UNNEST([
+        IF(efr.LAST_DEACTVD_DT < IFNULL(first_spark_now_dt, DATE '9999-12-30'), ONBDG_DT, NULL),
+        IF(CMS_Withdrawn_DT < IFNULL(first_spark_now_dt, DATE '9999-12-30'), CMS_Withdrawn_DT, NULL)
+        ]) AS d
+  ) AS kpi_1_numerator_dt,
+
+  -- date of drivers onboarded or blocked 
+  (SELECT MAX(d)
+  FROM UNNEST([
+        latest_idv_fail_dt,
+        latest_mvr_denied_dt,
+        latest_cbc_denied_dt,
+        latest_invalid_insurance,
+        latest_ocr_fail_dt,
+        CMS_Withdrawn_DT,
+        ONBDG_DT
+        ]) AS d
+  ) AS kpi_1_denominator_dt,
+
+  ## KPI 2 - PREVENTION: APPLICANTS BLOCKED DIVIDED BY APPLICANTS FLAGGED
+  -- date of blocked applications
+  CMS_Withdrawn_DT as kpi_2_numerator_dt,
+
+  -- date of flagged applications
+  (select max(d)
+    from unnest([
+        latest_idv_fail_dt,
+        latest_mvr_denied_dt,
+        latest_cbc_denied_dt,
+        latest_invalid_insurance,
+        latest_ocr_fail_dt
+    ]) as d
+  ) as kpi_2_denominator_dt,
+
+  ## KPI 3 - DETECTION: DRIVERS BLOCKED AFTER SPARK NOW DIVIDED BY DRIVERS PAUSED AFTER SPARK NOW
+  -- date of drivers blocked after first spark now
+  case when efr.LAST_DEACTVD_DT >= first_spark_now_dt
+        then efr.LAST_DEACTVD_DT else null 
+    end as kpi_3_numerator_dt,
+
+  -- date of drivers blocked after first spark now
+  case when latest_paused_dt >= first_spark_now_dt
+      then latest_paused_dt else null
+  end as kpi_3_denominator_dt,
+
+   ## KPI 3a - DETECTION: TOTAL DEACTIVATIONS POST SPARK NOW DIVIDED BY TOTAL DRIVERS POST SPARK NOW
+  -- onboarding date of drivers deactivated post spark now
+  case when efr.LAST_DEACTVD_DT >= first_spark_now_dt
+        then efr.ONBDG_DT else null 
+    end as kpi_3a_numerator_dt,
+
+  -- onboarding date of driver who turned on spark now
+  case when first_spark_now_ind = 1
+      then efr.ONBDG_DT else null
+  end as kpi_3a_denominator_dt,
+
+     ## KPI 3b - DETECTION: TOTAL DEACTIVATIONS POST SPARK NOW DIVIDED BY TOTAL DRIVERS FLAGGED POST SPARK NOW
+  -- onboarding date of drivers deactivated post spark now
+  case when efr.LAST_DEACTVD_DT >= first_spark_now_dt
+        then efr.ONBDG_DT else null 
+    end as kpi_3b_numerator_dt,
+
+  -- onboarding date of drivers flagged post spark now
+  case when first_spark_now_ind = 1 and 
+          (fraud_star_flag_ind is not null or acct_sharing_flag_ind is not null or radar_flag_ind is not null
+            or inkiru_flag_ind is not null or persona_flag_ind is not null  --or on_trip_fraud_flag_ind = 1 
+            or graph_flag_ind is not null  or fraud_ops_flag_ind is not null  or shield_flag_ind is not null )
+      then efr.ONBDG_DT else null
+  end as kpi_3b_denominator_dt,
+
+  -- trips taken out of deactivated drivers (to be averaged)
+
+  -- date of appeals that were overturned
+  case when efa.overturned = 1
+        then latest_appeal_complete_date else null
+  end as kpi_5_numerator_dt
+
+  -- kpi_5_denominator = latest_appeal_complete_date
+
+from efr 
+left join efa
+on efr.DRVR_USER_ID = efa.drvr_user_id
+);
+
+
+create or replace table `sample_unpivot` as (
+with
+unpivoted_data as (
+select
+  DRVR_USER_ID,
+  DRVR_STATUS,
+  ONBDG_DT, 
+  CMS_Withdrawn_DT,
+  LAST_DEACTVD_DT,
+  Trip_Completed_Ind,
+  FRAUD_SYSTEM,
+  LATEST_FLAGGED_DT
+from `final_table`
+UNPIVOT (
+  LATEST_FLAGGED_DT for FRAUD_SYSTEM in (
+    --Prevention
+    latest_idv_fail_dt as 'CMS_IDV',
+    latest_ocr_fail_dt as 'Insurance',
+    latest_invalid_insurance as 'Insurance',
+    latest_mvr_denied_dt as 'Checkr',
+    latest_cbc_denied_dt as 'Checkr',
+
+    --Detection
+    fraud_star_latest_flag_dt as 'Fraud Star',
+    acct_sharing_flag_dt as 'Account Sharing',
+    radar_latest_flag_dt as 'Radar',
+    inkiru_latest_flag_dt as 'Inkiru',
+    persona_latest_flag_dt as 'Persona',
+    --on_trip_fraud_latest_flag_dt as 'On Trip Models',
+    graph_latest_flag_dt as 'Graph',
+    fraud_ops_latest_flag_dt as 'FraudOps Investigations',
+    shield_latest_flag_dt as 'Shield'
+  )
+)
+where LATEST_FLAGGED_DT is not null
+),
+
+fraud_sys as (
+select 
+  DRVR_USER_ID,
+  DRVR_STATUS,
+  ONBDG_DT, 
+  CMS_Withdrawn_DT,
+  LAST_DEACTVD_DT,
+  Trip_Completed_Ind,
+  case 
+          when FRAUD_SYSTEM in ('Checkr', 'Insurance', 'CMS_IDV') then 'Prevention'
+          when FRAUD_SYSTEM in ('Account Sharing', 'Fraud Star', 'Graph', 'FraudOps Investigations', 'Inkiru', 'On Trip Models', 'Persona', 'Radar', 'Shield' ) then 'Detection'
+              
+              else 'Other' end as CATEGORY,
+  FRAUD_SYSTEM,
+  LATEST_FLAGGED_DT,
+  cal.WM_WK
+from unpivoted_data ud
+left join `week_table` cal
+on ud.LATEST_FLAGGED_DT = cal.CAL_DT
+),
+
+flagged_drvrs as (
+select WM_WK, CATEGORY, FRAUD_SYSTEM, count(distinct DRVR_USER_ID) FLAGGED_DRVRS
+from fraud_sys 
+--where wm_wk in ('202501')
+group by 1,2,3
+order by 1
+),
+
+withdrawn_sys as (
+select WM_WK, DRVR_USER_ID, CATEGORY, FRAUD_SYSTEM, 
+        max(LATEST_FLAGGED_DT) over(partition by DRVR_USER_ID, CATEGORY) as LATEST_FLAGGED_DT,
+        CMS_Withdrawn_DT
+from (
+  select *
+  from fraud_sys
+  where CMS_Withdrawn_DT is not null
+  and category = 'Prevention'
+)
+),
+
+deact_sys as (
+select WM_WK, DRVR_USER_ID, CATEGORY, FRAUD_SYSTEM, 
+        max(LATEST_FLAGGED_DT) over(partition by DRVR_USER_ID, CATEGORY) as LATEST_FLAGGED_DT,
+        LAST_DEACTVD_DT
+from (
+  select *
+  from fraud_sys
+  where LAST_DEACTVD_DT is not null
+  and category = 'Detection'
+)
+where LAST_DEACTVD_DT is not null
+),
+
+
+deactd_drvrs as (
+select WM_WK, CATEGORY, FRAUD_SYSTEM, count(distinct DRVR_USER_ID) as DEACTD_DRVRS
+from deact_sys 
+group by 1,2,3
+order by 1
+),
+
+withdrawn_drvrs as (
+select WM_WK, CATEGORY, FRAUD_SYSTEM, count(distinct DRVR_USER_ID) as Withdrawn_DRVRS
+from withdrawn_sys 
+group by 1,2,3
+order by 1
+)
+
+select fd.WM_WK, fd.CATEGORY, fd.FRAUD_SYSTEM,  
+                ifnull(FLAGGED_DRVRS, 0) as FLAGGED_DRVRS, 
+                ifnull(DEACTD_DRVRS, 0) as DEACTD_DRVRS,
+                ifnull(Withdrawn_DRVRS, 0) as Withdrawn_DRVRS
+from flagged_drvrs fd 
+left join deactd_drvrs dd 
+on fd.WM_WK = dd.WM_WK
+and fd.FRAUD_SYSTEM = dd.FRAUD_SYSTEM
+left join withdrawn_drvrs wd 
+on fd.WM_WK = wd.WM_WK
+and fd.FRAUD_SYSTEM = wd.FRAUD_SYSTEM
+);
+
+create or replace table `appeal_unpivot` as (
+
+with cte as (
+select DRVR_USER_ID, DRVR_STATUS, CMS_Withdrawn_DT, ONBDG_DT, LAST_DEACTVD_DT, appeal_reason_code, appeal_sub_reason_code, latest_appeal_report_date, latest_appeal_complete_date, overturned, WM_WK
+from `final_table`
+left join `week_table` cal
+on latest_appeal_complete_date = cal.CAL_DT
+where latest_appeal_complete_date is not null
+),
+
+ap as (
+select WM_WK, 
+        appeal_sub_reason_code, 
+        count(distinct drvr_user_id) as appeals
+from cte 
+group by 1,2
+),
+
+ov as (
+select WM_WK, 
+      appeal_sub_reason_code, 
+        count(distinct drvr_user_id) as overturns
+from cte 
+where overturned = 1
+group by 1,2
+),
+
+fin as (
+select ap.WM_WK,  
+        ap.appeal_sub_reason_code,
+        case when ap.appeal_sub_reason_code = 'Continuous Monitoring' then 'Continuous Monitoring'
+            when lower(ap.appeal_sub_reason_code) like '%persona%' then 'Persona'
+            when lower(ap.appeal_sub_reason_code) like '%falsification%' then 'Falsification'
+            when lower(ap.appeal_sub_reason_code) like '%graph%' then 'Graph'
+            when lower(ap.appeal_sub_reason_code) like '%theft%' then 'Order Theft '
+            when lower(ap.appeal_sub_reason_code) like '%abuse%' then 'On-Trip Models/System Abuse'
+            when ap.appeal_sub_reason_code = 'WMT Associate Driving for Spark' then 'WMT Associate Driving for Spark'
+            when ap.appeal_sub_reason_code = 'Account Sharing' then 'Account Sharing'
+            when ap.appeal_sub_reason_code = 'Missing Order Offender' then 'Missing Order'
+            else 'Others' end as appeals_category,
+        appeals, overturns
+from ap 
+left join ov 
+on ap.WM_WK = ov.WM_WK
+and ap.appeal_sub_reason_code = ov.appeal_sub_reason_code
+)
+
+select wm_wk, appeals_category, sum(appeals) as appeals, sum(overturns) as overturns
+from fin 
+group by 1,2
+);
+
+create or replace table `summary_table` as (
+with unpivoted_data as (
+select
+  DRVR_USER_ID,
+  DRVR_STATUS,
+  Delivered_Trips,
+  Accepted_Trips,
+  overturned,
+  KPI_DATE,
+  KPI_TYPE
+
+from `final_table`
+  UNPIVOT(
+    KPI_DATE for KPI_TYPE in (
+    (kpi_1_numerator_dt) as 'kpi_1_numerator',
+    (kpi_1_denominator_dt) as 'kpi_1_denominator',
+    (kpi_2_numerator_dt ) as 'kpi_2_numerator',
+    (kpi_2_denominator_dt) as 'kpi_2_denominator',
+    (kpi_3_numerator_dt) as 'kpi_3_numerator',
+    (kpi_3_denominator_dt) as 'kpi_3_denominator',
+    (kpi_3a_numerator_dt) as 'kpi_3a_numerator',
+    (kpi_3a_denominator_dt) as 'kpi_3a_denominator',
+    (kpi_3b_numerator_dt) as 'kpi_3b_numerator',
+    (kpi_3b_denominator_dt) as 'kpi_3b_denominator',
+    (LAST_DEACTVD_DT) as 'kpi_4_value',
+    (kpi_5_numerator_dt) as 'kpi_5_numerator',
+    (latest_appeal_complete_date) as 'kpi_5_denominator'
+  ))
+where KPI_DATE is not null
+),
+
+with_cal as (
+select
+  DRVR_USER_ID,
+  DRVR_STATUS,
+  Delivered_Trips,
+  Accepted_Trips,
+  KPI_DATE,
+  KPI_TYPE,
+  cal.WM_WK
+from unpivoted_data ud 
+left join `LMD_DA.WMT_WEEK` cal
+on ud.KPI_DATE = cal.CAL_DT
+)
+
+select
+  WM_WK,
+  KPI_TYPE,
+  case when KPI_TYPE = 'kpi_4_value'
+        then ROUND(AVG(Delivered_Trips),0)
+  else count(distinct DRVR_USER_ID)
+        end as KPI_VALUE
+from with_cal
+group by 1,2
+);
+
+
